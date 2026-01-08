@@ -1,0 +1,539 @@
+"""
+Handler Telegram - logica identica al workflow n8n SLAPPY_v47_LOCK
+"""
+import json
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from telegram.error import TelegramError
+
+import database as db
+from validators import validate_name, validate_dob
+
+logger = logging.getLogger(__name__)
+
+
+def log_action(chat_id: int, stato: str, action: str, extra: dict = None):
+    """Logging JSON per debug"""
+    log_data = {"chat_id": chat_id, "stato": stato, "action": action}
+    if extra:
+        log_data.update(extra)
+    logger.info(json.dumps(log_data))
+
+
+def get_action(
+    is_start: bool,
+    is_callback: bool,
+    callback_data: str,
+    message_text: str,
+    user: dict,
+    config: dict
+) -> str:
+    """
+    Determina l'azione da eseguire - LOGICA IDENTICA a 04_Prepara_Contesto n8n
+    """
+    exists = user is not None
+    stato = user.get("stato_onboarding", "new") if user else "new"
+
+    max_utenti = int(config.get("max_utenti", "99999"))
+    utenti_count = int(config.get("utenti_count", "0"))
+
+    cb = callback_data or ""
+    is_text = not is_callback and not is_start and bool(message_text)
+
+    # Check limite utenti per nuovi utenti
+    if is_start and not exists and utenti_count >= max_utenti:
+        return "limite_raggiunto"
+
+    # /start
+    if is_start:
+        if not exists:
+            return "new_user"
+        elif stato == "completo":
+            return "returning"
+        elif stato == "uscito":
+            return "new_user"
+        # FIX: Resume onboarding per utenti a metà
+        elif stato == "lingua_ok":
+            return "resume_privacy"
+        elif stato == "privacy_ok":
+            return "resume_nome"
+        elif stato == "nome_ok":
+            return "resume_data"
+        else:
+            return "new_user"
+
+    # Callback bottoni
+    if cb.startswith("lang_"):
+        return "set_lang"
+    if cb == "privacy_accept":
+        return "privacy_yes"
+    if cb == "privacy_reject":
+        return "privacy_no"
+    if cb.startswith("menu_"):
+        return "menu"
+
+    # Input testo durante onboarding
+    if is_text and stato == "privacy_ok":
+        return "input_name"
+    if is_text and stato == "nome_ok":
+        return "input_dob"
+
+    # Utente completo che scrive
+    if stato == "completo":
+        return "menu"
+
+    return "fallback"
+
+
+async def delete_message_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int):
+    """Cancella messaggio in modo sicuro (ignora errori)"""
+    if not msg_id:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except TelegramError as e:
+        logger.debug(f"Impossibile cancellare messaggio {msg_id}: {e}")
+
+
+async def answer_callback_safe(callback_query):
+    """Risponde al callback in modo sicuro"""
+    try:
+        await callback_query.answer()
+    except TelegramError:
+        pass
+
+
+async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler principale - elabora ogni update"""
+
+    # Estrai dati (nodo 02_Estrai_Dati)
+    chat_id = None
+    callback_data = ""
+    message_text = ""
+    is_start = False
+    is_callback = False
+    user_msg_id = None
+    callback_msg_id = None
+    update_id = update.update_id
+
+    if update.callback_query:
+        is_callback = True
+        chat_id = update.callback_query.message.chat.id
+        callback_data = update.callback_query.data or ""
+        callback_msg_id = update.callback_query.message.message_id
+    elif update.message:
+        chat_id = update.message.chat.id
+        message_text = update.message.text or ""
+        user_msg_id = update.message.message_id
+        is_start = message_text.strip().lower().startswith("/start")
+
+    if not chat_id:
+        return
+
+    # Cerca utente (nodo 03_DB_Cerca_Utente)
+    user = db.get_user(chat_id)
+
+    # Check duplicato update_id (FIX scalabilità)
+    if user and user.get("last_update_id", 0) >= update_id:
+        logger.info(f"Update duplicato ignorato: {chat_id}/{update_id}")
+        if is_callback:
+            await answer_callback_safe(update.callback_query)
+        return
+
+    # Carica testi e config (nodi 03B, 03C - con cache)
+    config = db.get_config()
+    lingua = user.get("lingua", "it") if user else "it"
+    nome = user.get("nome", "") if user else ""
+    last_bot_msg_id = user.get("last_bot_msg_id") if user else None
+    last_bot_msg_step = user.get("last_bot_msg_step") if user else None
+    stato = user.get("stato_onboarding", "new") if user else "new"
+
+    # Determina azione (nodo 04_Prepara_Contesto)
+    action = get_action(
+        is_start=is_start,
+        is_callback=is_callback,
+        callback_data=callback_data,
+        message_text=message_text,
+        user=user,
+        config=config
+    )
+
+    log_action(chat_id, stato, action, {"update_id": update_id})
+
+    # Gestione cancellazione messaggi (nodi 05-11)
+    if is_callback:
+        # Rispondi callback e cancella messaggio bottone
+        await answer_callback_safe(update.callback_query)
+        await delete_message_safe(context, chat_id, callback_msg_id)
+    elif user_msg_id and not is_start:
+        # Cancella messaggio utente durante onboarding
+        await delete_message_safe(context, chat_id, user_msg_id)
+        # Cancella messaggio bot precedente se stesso step
+        if last_bot_msg_id:
+            await delete_message_safe(context, chat_id, last_bot_msg_id)
+
+    # Esegui azione (nodo 12_Smista_Azione)
+    await execute_action(action, update, context, chat_id, update_id, user, lingua, nome, config, callback_data, message_text)
+
+
+async def execute_action(
+    action: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    update_id: int,
+    user: dict,
+    lingua: str,
+    nome: str,
+    config: dict,
+    callback_data: str,
+    message_text: str
+):
+    """Esegue l'azione determinata"""
+
+    if action == "new_user":
+        await action_new_user(context, chat_id, update_id)
+
+    elif action == "set_lang":
+        await action_set_lang(context, chat_id, update_id, callback_data)
+
+    elif action == "privacy_yes":
+        await action_privacy_yes(context, chat_id, update_id, lingua)
+
+    elif action == "privacy_no":
+        await action_privacy_no(context, chat_id, update_id, lingua)
+
+    elif action == "resume_privacy":
+        await action_resume_privacy(context, chat_id, update_id, lingua)
+
+    elif action == "resume_nome":
+        await action_resume_nome(context, chat_id, update_id, lingua)
+
+    elif action == "resume_data":
+        await action_resume_data(context, chat_id, update_id, lingua, nome)
+
+    elif action == "input_name":
+        await action_input_name(context, chat_id, update_id, message_text, lingua)
+
+    elif action == "input_dob":
+        await action_input_dob(context, chat_id, update_id, message_text, lingua, user)
+
+    elif action == "returning":
+        await action_returning(context, chat_id, update_id, nome, lingua)
+
+    elif action == "menu":
+        await action_menu(context, chat_id, update_id, callback_data, nome, lingua)
+
+    elif action == "limite_raggiunto":
+        await action_limite_raggiunto(context, chat_id, config, lingua)
+
+    else:  # fallback
+        await action_fallback(context, chat_id, lingua)
+
+
+# ============================================================
+# AZIONI SPECIFICHE
+# ============================================================
+
+async def action_new_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int):
+    """Nuovo utente - crea record e mostra scelta lingua (nodi 13, 13B, 14)"""
+    db.create_user(chat_id)
+    db.increment_utenti_count()
+
+    # Messaggio scelta lingua
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🇮🇹", callback_data="lang_it"),
+            InlineKeyboardButton("🇬🇧", callback_data="lang_en"),
+            InlineKeyboardButton("🇩🇪", callback_data="lang_de")
+        ]
+    ])
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text="🏖️ Cavallino-Treporti",
+        reply_markup=keyboard
+    )
+
+    db.save_last_bot_msg(chat_id, msg.message_id, "lingua")
+    db.update_user(chat_id, {"last_update_id": update_id})
+
+
+async def action_set_lang(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int, callback_data: str):
+    """Imposta lingua e mostra privacy (nodi 15, 16, 17)"""
+    lingua = callback_data.replace("lang_", "")
+    if lingua not in ("it", "en", "de"):
+        lingua = "it"
+
+    db.save_lingua(chat_id, lingua, update_id)
+
+    # Prepara messaggio privacy
+    text = db.get_text("step2_testo", lingua)
+    btn_si = db.get_text("btn_privacy_si", lingua)
+    btn_no = db.get_text("btn_privacy_no", lingua)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(btn_si, callback_data="privacy_accept"),
+            InlineKeyboardButton(btn_no, callback_data="privacy_reject")
+        ]
+    ])
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+    db.save_last_bot_msg(chat_id, msg.message_id, "privacy")
+
+
+async def action_privacy_yes(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int, lingua: str):
+    """Privacy accettata - chiedi nome (nodi 18, 19, 20)"""
+    db.save_privacy_ok(chat_id, update_id)
+
+    text = db.get_text("step3_chiedi_nome", lingua)
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML"
+    )
+
+    db.save_last_bot_msg(chat_id, msg.message_id, "nome")
+
+
+async def action_privacy_no(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int, lingua: str):
+    """Privacy rifiutata - messaggio uscita (nodi 21, 22)"""
+    db.save_privacy_no(chat_id, update_id)
+
+    text = db.get_text("msg_uscita", lingua)
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML"
+    )
+
+
+async def action_resume_privacy(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int, lingua: str):
+    """Resume onboarding - mostra privacy"""
+    text = db.get_text("step2_testo", lingua)
+    btn_si = db.get_text("btn_privacy_si", lingua)
+    btn_no = db.get_text("btn_privacy_no", lingua)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(btn_si, callback_data="privacy_accept"),
+            InlineKeyboardButton(btn_no, callback_data="privacy_reject")
+        ]
+    ])
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+    db.save_last_bot_msg(chat_id, msg.message_id, "privacy")
+    db.update_user(chat_id, {"last_update_id": update_id})
+
+
+async def action_resume_nome(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int, lingua: str):
+    """Resume onboarding - chiedi nome"""
+    text = db.get_text("step3_chiedi_nome", lingua)
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML"
+    )
+
+    db.save_last_bot_msg(chat_id, msg.message_id, "nome")
+    db.update_user(chat_id, {"last_update_id": update_id})
+
+
+async def action_resume_data(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int, lingua: str, nome: str):
+    """Resume onboarding - chiedi data nascita"""
+    text = db.get_text("step4_chiedi_data", lingua)
+    if nome:
+        text = text.replace("{nome}", nome)
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML"
+    )
+
+    db.save_last_bot_msg(chat_id, msg.message_id, "data")
+    db.update_user(chat_id, {"last_update_id": update_id})
+
+
+async def action_input_name(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int, message_text: str, lingua: str):
+    """Valida e salva nome (nodi 23-29)"""
+    is_valid, nome_pulito = validate_name(message_text)
+
+    if is_valid:
+        # Nome OK - salva e chiedi data
+        db.save_nome(chat_id, nome_pulito, update_id)
+
+        text = db.get_text("step4_chiedi_data", lingua)
+        text = text.replace("{nome}", nome_pulito)
+
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML"
+        )
+
+        db.save_last_bot_msg(chat_id, msg.message_id, "data")
+
+    else:
+        # Nome non valido
+        text = db.get_text("msg_errore_nome", lingua)
+
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML"
+        )
+
+        db.save_last_bot_msg(chat_id, msg.message_id, "nome")
+        db.update_user(chat_id, {"last_update_id": update_id})
+
+
+async def action_input_dob(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int, message_text: str, lingua: str, user: dict):
+    """Valida e salva data nascita (nodi 30-35)"""
+    is_valid, data_str, is_minorenne = validate_dob(message_text)
+    nome = user.get("nome", "") if user else ""
+
+    if is_valid:
+        # Data OK - salva e mostra completamento
+        db.save_data_nascita(chat_id, data_str, is_minorenne, update_id)
+
+        keyboard = get_menu_keyboard(lingua)
+
+        text = f"✅ Tutto pronto, {nome}!\nOra esplora il menu 👇"
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+    else:
+        # Data non valida
+        error_count = db.increment_dob_error(chat_id, update_id)
+
+        text = db.get_text("msg_errore_data", lingua)
+
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML"
+        )
+
+        db.save_last_bot_msg(chat_id, msg.message_id, "data")
+
+
+async def action_returning(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int, nome: str, lingua: str):
+    """Utente che ritorna - mostra menu (nodo 36)"""
+    keyboard = get_menu_keyboard(lingua)
+
+    text = f"👋 Bentornato, {nome}!"
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+    db.update_user(chat_id, {"last_update_id": update_id})
+
+
+async def action_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_id: int, callback_data: str, nome: str, lingua: str):
+    """Gestisce click su menu"""
+    menu_key = callback_data.replace("menu_", "") if callback_data.startswith("menu_") else ""
+
+    # Mappa callback -> chiave testo
+    menu_responses = {
+        "sos": "resp_sos",
+        "meteo": "resp_meteo",
+        "eventi": "resp_eventi",
+        "trasporti": "resp_trasporti",
+        "idee": "resp_idee"
+    }
+
+    if menu_key in menu_responses:
+        text = db.get_text(menu_responses[menu_key], lingua)
+        if "{nome}" in text:
+            text = text.replace("{nome}", nome)
+
+        keyboard = get_menu_keyboard(lingua)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    else:
+        # Menu generico (utente scrive qualcosa)
+        keyboard = get_menu_keyboard(lingua)
+        text = f"👋 Bentornato, {nome}!"
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+    db.update_user(chat_id, {"last_update_id": update_id})
+
+
+async def action_limite_raggiunto(context: ContextTypes.DEFAULT_TYPE, chat_id: int, config: dict, lingua: str):
+    """Limite utenti raggiunto (nodo 38)"""
+    canale_link = config.get("canale_telegram", "https://t.me/tuocanale")
+    text = db.get_text("msg_limite", lingua)
+    text = text.replace("{canale}", canale_link)
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML"
+    )
+
+
+async def action_fallback(context: ContextTypes.DEFAULT_TYPE, chat_id: int, lingua: str):
+    """Messaggio non capito (nodo 37)"""
+    text = db.get_text("msg_fallback", lingua)
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML"
+    )
+
+
+def get_menu_keyboard(lingua: str) -> InlineKeyboardMarkup:
+    """Genera tastiera menu principale"""
+    # I testi dei bottoni potrebbero essere tradotti, per ora fissi
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("☀️ Meteo", callback_data="menu_meteo"),
+            InlineKeyboardButton("🎪 Eventi", callback_data="menu_eventi")
+        ],
+        [
+            InlineKeyboardButton("🚌 Trasporti", callback_data="menu_trasporti"),
+            InlineKeyboardButton("🧭 Idee per oggi", callback_data="menu_idee")
+        ],
+        [
+            InlineKeyboardButton("🚑 SOS & NUMERI UTILI 🚑", callback_data="menu_sos")
+        ]
+    ])
