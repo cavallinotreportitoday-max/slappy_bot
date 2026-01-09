@@ -10,6 +10,7 @@ from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
 API_TIMEOUT = 5  # Timeout per chiamate API esterne in secondi
+COMUNE_BASE = "https://www.comune.cavallinotreporti.ve.it"
 
 import database as db
 from config import ADMIN_CHAT_ID
@@ -133,6 +134,15 @@ async def answer_callback_safe(callback_query):
         await callback_query.answer()
     except TelegramError:
         pass
+
+
+async def edit_message_safe(query, text: str, reply_markup=None, parse_mode: str = "HTML"):
+    """Edita messaggio ignorando errore 'Message is not modified'"""
+    try:
+        await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            raise
 
 
 async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -611,6 +621,102 @@ async def action_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_i
         await handle_eventi(context, chat_id, lingua, query)
         db.update_user(chat_id, {"last_update_id": update_id})
         return
+
+    # ============ ROUTING EVENTI COMPLETO ============
+    # evt_home - Home eventi
+    if callback_data == "evt_home":
+        await handle_eventi(context, chat_id, lingua, query)
+        db.update_user(chat_id, {"last_update_id": update_id})
+        return
+
+    # evt_oggi, evt_domani, evt_sett_0, evt_sett_1 - Liste per periodo
+    if callback_data in ("evt_oggi", "evt_domani", "evt_sett_0", "evt_sett_1"):
+        periodo = callback_data.replace("evt_", "")
+        await handle_eventi_lista(context, chat_id, lingua, query, periodo=periodo, pagina=0)
+        db.update_user(chat_id, {"last_update_id": update_id})
+        return
+
+    # evt_list_{periodo}_p{N} - Paginazione liste
+    if callback_data.startswith("evt_list_"):
+        import re
+        match = re.match(r"evt_list_(\w+)_p(\d+)", callback_data)
+        if match:
+            periodo = match.group(1)
+            pagina = int(match.group(2))
+            await handle_eventi_lista(context, chat_id, lingua, query, periodo=periodo, pagina=pagina)
+            db.update_user(chat_id, {"last_update_id": update_id})
+            return
+
+    # evt_categoria - Lista categorie
+    if callback_data == "evt_categoria":
+        await handle_eventi_categorie(context, chat_id, lingua, query)
+        db.update_user(chat_id, {"last_update_id": update_id})
+        return
+
+    # evt_cat_{tipo}_p{N} - Eventi per categoria con paginazione
+    if callback_data.startswith("evt_cat_"):
+        import re
+        match = re.match(r"evt_cat_(\w+)_p(\d+)", callback_data)
+        if match:
+            categoria = match.group(1)
+            pagina = int(match.group(2))
+            # Per le categorie usiamo un periodo ampio (prossimi 90 giorni)
+            from datetime import date, timedelta
+            oggi = date.today()
+            data_inizio = oggi.isoformat()
+            data_fine = (oggi + timedelta(days=90)).isoformat()
+            eventi = db.get_eventi_periodo(data_inizio, data_fine, limit=5, offset=pagina*5, categoria=categoria)
+            totale = db.get_eventi_count_periodo(data_inizio, data_fine, categoria=categoria)
+            # Richiama handle_eventi_lista con categoria
+            await handle_eventi_lista(context, chat_id, lingua, query, periodo="sett_0", pagina=pagina, categoria=categoria)
+            db.update_user(chat_id, {"last_update_id": update_id})
+            return
+
+    # evt_detail_{id} - Dettaglio evento
+    if callback_data.startswith("evt_detail_"):
+        try:
+            evento_id = int(callback_data.replace("evt_detail_", ""))
+            await handle_evento_dettaglio(context, chat_id, lingua, query, evento_id)
+            db.update_user(chat_id, {"last_update_id": update_id})
+            return
+        except ValueError:
+            pass
+
+    # evt_cal - Calendario mese corrente
+    if callback_data == "evt_cal":
+        await handle_eventi_calendario(context, chat_id, lingua, query)
+        db.update_user(chat_id, {"last_update_id": update_id})
+        return
+
+    # evt_cal_{anno}_{mese} - Calendario mese specifico
+    if callback_data.startswith("evt_cal_") and not callback_data.startswith("evt_cal_giorno_"):
+        import re
+        match = re.match(r"evt_cal_(\d+)_(\d+)", callback_data)
+        if match:
+            anno = int(match.group(1))
+            mese = int(match.group(2))
+            await handle_eventi_calendario(context, chat_id, lingua, query, anno=anno, mese=mese)
+            db.update_user(chat_id, {"last_update_id": update_id})
+            return
+
+    # evt_cal_giorno_{anno}_{mese}_{giorno} - Eventi di un giorno specifico
+    if callback_data.startswith("evt_cal_giorno_"):
+        import re
+        match = re.match(r"evt_cal_giorno_(\d+)_(\d+)_(\d+)", callback_data)
+        if match:
+            anno = int(match.group(1))
+            mese = int(match.group(2))
+            giorno = int(match.group(3))
+            await handle_eventi_giorno(context, chat_id, lingua, query, anno, mese, giorno)
+            db.update_user(chat_id, {"last_update_id": update_id})
+            return
+
+    # noop - Bottone placeholder (es. numero pagina)
+    if callback_data == "noop":
+        if query:
+            await query.answer()
+        return
+    # ============ FINE ROUTING EVENTI ============
 
     if menu_key == "trasporti":
         await handle_trasporti(context, chat_id, lingua, query)
@@ -1695,146 +1801,512 @@ Spaß für jeden Geschmack!
         )
 
 
+# ============================================================
+# SISTEMA EVENTI COMPLETO
+# ============================================================
+
+# Emoji per categorie eventi
+CATEGORIA_EMOJI = {
+    "mercato": "🛒",
+    "sagra": "🍝",
+    "musica": "🎵",
+    "cultura": "🎭",
+    "sport": "⚽",
+    "famiglia": "👨‍👩‍👧‍👦",
+    "altro": "🎪"
+}
+
+# Traduzioni categorie
+CATEGORIA_LABELS = {
+    "mercato": {"it": "Mercati", "en": "Markets", "de": "Märkte"},
+    "sagra": {"it": "Sagre", "en": "Festivals", "de": "Feste"},
+    "musica": {"it": "Musica", "en": "Music", "de": "Musik"},
+    "cultura": {"it": "Cultura", "en": "Culture", "de": "Kultur"},
+    "sport": {"it": "Sport", "en": "Sports", "de": "Sport"},
+    "famiglia": {"it": "Famiglia", "en": "Family", "de": "Familie"}
+}
+
+EVENTI_PER_PAGINA = 5
+
+
+def _get_periodo_date(periodo: str):
+    """Calcola date inizio/fine per un periodo."""
+    from datetime import date, timedelta
+
+    oggi = date.today()
+
+    if periodo == "oggi":
+        return oggi.isoformat(), oggi.isoformat()
+    elif periodo == "domani":
+        domani = oggi + timedelta(days=1)
+        return domani.isoformat(), domani.isoformat()
+    elif periodo == "sett_0":  # Questa settimana
+        # Da oggi a domenica
+        giorni_a_domenica = 6 - oggi.weekday()
+        fine_settimana = oggi + timedelta(days=giorni_a_domenica)
+        return oggi.isoformat(), fine_settimana.isoformat()
+    elif periodo == "sett_1":  # Prossima settimana
+        # Lunedì prossimo a domenica prossima
+        giorni_a_lunedi = 7 - oggi.weekday()
+        lunedi_prossimo = oggi + timedelta(days=giorni_a_lunedi)
+        domenica_prossima = lunedi_prossimo + timedelta(days=6)
+        return lunedi_prossimo.isoformat(), domenica_prossima.isoformat()
+    else:
+        # Default: prossimi 7 giorni
+        return oggi.isoformat(), (oggi + timedelta(days=7)).isoformat()
+
+
+def _format_evento_lista(evento: dict, lingua: str, numero: int = None) -> str:
+    """Formatta un evento per la lista con numero progressivo."""
+    titolo = evento.get(f"titolo_{lingua}") or evento.get("titolo_it", "Evento")
+    luogo = evento.get("luogo", "")
+
+    if numero:
+        line = f"<b>{numero}.</b> {titolo}"
+    else:
+        line = f"<b>{titolo}</b>"
+    if luogo:
+        line += f"\n   📍 {luogo}"
+    return line
+
+
 async def handle_eventi(context, chat_id: int, lingua: str, query=None):
     """
-    Mostra eventi e manifestazioni nella zona.
+    HOME EVENTI - Mostra evento imperdibile e bottoni navigazione.
+    Callback: evt_home o menu_eventi
     """
-    # Rispondi al callback SUBITO
+    from datetime import date, timedelta
+
     if query:
         await query.answer()
 
-    text = db.get_text("info_eventi", lingua)
+    oggi = date.today()
 
-    if text == "info_eventi":
-        fallback = {
-            "it": """🎪 <b>Eventi a Cavallino-Treporti</b>
+    # Titolo
+    titoli = {
+        "it": "🎪 <b>Eventi a Cavallino-Treporti</b>",
+        "en": "🎪 <b>Events in Cavallino-Treporti</b>",
+        "de": "🎪 <b>Veranstaltungen in Cavallino-Treporti</b>"
+    }
 
-Scopri cosa succede nella zona!
+    text = titoli.get(lingua, titoli["it"]) + "\n\n"
 
-🎆 <b>Estate</b>
-• Fuochi d'artificio sulla spiaggia
-• Concerti e spettacoli serali
-• Sagre e feste paesane
-• Cinema all'aperto
+    # Evento imperdibile del giorno
+    imperdibile = db.get_evento_imperdibile()
+    if imperdibile:
+        titolo_imp = imperdibile.get(f"titolo_{lingua}") or imperdibile.get("titolo_it", "")
+        luogo_imp = imperdibile.get("luogo", "")
+        orario_imp = imperdibile.get("orario", "")
 
-🎭 <b>Mercati</b>
-• Mercato settimanale (martedì)
-• Mercatini dell'artigianato
-• Mercato del pesce fresco
+        imp_labels = {"it": "DA NON PERDERE OGGI", "en": "DON'T MISS TODAY", "de": "HEUTE NICHT VERPASSEN"}
+        text += f"⭐ <b>{imp_labels.get(lingua, imp_labels['it'])}</b>\n"
+        text += f"🎪 {titolo_imp}\n"
+        if orario_imp:
+            text += f"🕐 {orario_imp}"
+        if luogo_imp:
+            text += f" • 📍 {luogo_imp}"
+        text += "\n\n"
 
-🏃 <b>Sport</b>
-• Gare di beach volley
-• Tornei di calcetto
-• Regate in laguna
-• Corse podistiche
+    # Conta eventi per periodo
+    oggi_count = db.get_eventi_count_periodo(oggi.isoformat(), oggi.isoformat())
+    domani_count = db.get_eventi_count_periodo((oggi + timedelta(days=1)).isoformat(), (oggi + timedelta(days=1)).isoformat())
 
-🎨 <b>Cultura</b>
-• Mostre nei fortini
-• Visite guidate storiche
-• Laboratori per bambini
+    # Info rapida
+    info_labels = {"it": "Cosa vuoi vedere?", "en": "What would you like to see?", "de": "Was möchten Sie sehen?"}
+    text += f"<i>{info_labels.get(lingua, info_labels['it'])}</i>"
 
-🍷 <b>Enogastronomia</b>
-• Festa del pesce
-• Degustazioni vini DOC
-• Sagra delle castraure
-
-📱 <b>Per info aggiornate:</b>
-• Pro Loco Cavallino-Treporti
-• Sito del Comune
-• Reception del tuo campeggio""",
-            "en": """🎪 <b>Events in Cavallino-Treporti</b>
-
-Discover what's happening in the area!
-
-🎆 <b>Summer</b>
-• Fireworks on the beach
-• Evening concerts and shows
-• Local festivals and fairs
-• Open-air cinema
-
-🎭 <b>Markets</b>
-• Weekly market (Tuesday)
-• Craft markets
-• Fresh fish market
-
-🏃 <b>Sports</b>
-• Beach volleyball competitions
-• Football tournaments
-• Lagoon regattas
-• Running races
-
-🎨 <b>Culture</b>
-• Exhibitions in the forts
-• Historical guided tours
-• Workshops for children
-
-🍷 <b>Food & Wine</b>
-• Fish festival
-• DOC wine tastings
-• Castraure artichoke festival
-
-📱 <b>For updated info:</b>
-• Pro Loco Cavallino-Treporti
-• Municipality website
-• Your campsite reception""",
-            "de": """🎪 <b>Veranstaltungen in Cavallino-Treporti</b>
-
-Entdecken Sie, was in der Gegend passiert!
-
-🎆 <b>Sommer</b>
-• Feuerwerk am Strand
-• Abendkonzerte und Shows
-• Lokale Feste und Jahrmärkte
-• Freiluftkino
-
-🎭 <b>Märkte</b>
-• Wochenmarkt (Dienstag)
-• Handwerksmärkte
-• Frischfischmarkt
-
-🏃 <b>Sport</b>
-• Beachvolleyball-Turniere
-• Fußballturniere
-• Lagunen-Regatten
-• Laufwettbewerbe
-
-🎨 <b>Kultur</b>
-• Ausstellungen in den Festungen
-• Historische Führungen
-• Workshops für Kinder
-
-🍷 <b>Essen & Wein</b>
-• Fischfest
-• DOC-Weinverkostungen
-• Castraure-Artischockenfest
-
-📱 <b>Für aktuelle Infos:</b>
-• Pro Loco Cavallino-Treporti
-• Website der Gemeinde
-• Rezeption Ihres Campingplatzes"""
-        }
-        text = fallback.get(lingua, fallback["it"])
-
-    text += "\n\n🦭 <i>SLAPPY</i>"
+    # Bottoni periodo
+    btn_oggi = {"it": f"📅 Oggi ({oggi_count})", "en": f"📅 Today ({oggi_count})", "de": f"📅 Heute ({oggi_count})"}
+    btn_domani = {"it": f"📅 Domani ({domani_count})", "en": f"📅 Tomorrow ({domani_count})", "de": f"📅 Morgen ({domani_count})"}
+    btn_sett0 = {"it": "📅 Questa settimana", "en": "📅 This week", "de": "📅 Diese Woche"}
+    btn_sett1 = {"it": "📅 Prossima settimana", "en": "📅 Next week", "de": "📅 Nächste Woche"}
+    btn_cal = {"it": "🗓️ Calendario", "en": "🗓️ Calendar", "de": "🗓️ Kalender"}
+    btn_cat = {"it": "🏷️ Categorie", "en": "🏷️ Categories", "de": "🏷️ Kategorien"}
+    btn_back = {"it": "◀️ Menu", "en": "◀️ Menu", "de": "◀️ Menü"}
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ Menu", callback_data="menu_back")]
+        [
+            InlineKeyboardButton(btn_oggi.get(lingua, btn_oggi["it"]), callback_data="evt_oggi"),
+            InlineKeyboardButton(btn_domani.get(lingua, btn_domani["it"]), callback_data="evt_domani")
+        ],
+        [
+            InlineKeyboardButton(btn_sett0.get(lingua, btn_sett0["it"]), callback_data="evt_sett_0"),
+            InlineKeyboardButton(btn_sett1.get(lingua, btn_sett1["it"]), callback_data="evt_sett_1")
+        ],
+        [
+            InlineKeyboardButton(btn_cal.get(lingua, btn_cal["it"]), callback_data="evt_cal"),
+            InlineKeyboardButton(btn_cat.get(lingua, btn_cat["it"]), callback_data="evt_categoria")
+        ],
+        [InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data="menu_home")]
     ])
 
-    # Edita messaggio esistente invece di mandarne uno nuovo
     if query:
-        await query.edit_message_text(
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
+        await edit_message_safe(query, text=text, reply_markup=keyboard)
     else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def handle_eventi_lista(context, chat_id: int, lingua: str, query, periodo: str, pagina: int = 0, categoria: str = None):
+    """
+    LISTA EVENTI con paginazione.
+    Callback: evt_{periodo}_p{pagina} o evt_cat_{categoria}_p{pagina}
+    """
+    from datetime import date, timedelta
+
+    if query:
+        await query.answer()
+
+    oggi = date.today()
+    data_inizio, data_fine = _get_periodo_date(periodo)
+
+    # Titoli periodo
+    titoli_periodo = {
+        "oggi": {"it": "Eventi di Oggi", "en": "Today's Events", "de": "Heute"},
+        "domani": {"it": "Eventi di Domani", "en": "Tomorrow's Events", "de": "Morgen"},
+        "sett_0": {"it": "Questa Settimana", "en": "This Week", "de": "Diese Woche"},
+        "sett_1": {"it": "Prossima Settimana", "en": "Next Week", "de": "Nächste Woche"}
+    }
+
+    titolo = titoli_periodo.get(periodo, {}).get(lingua, "Eventi")
+    if categoria:
+        cat_label = CATEGORIA_LABELS.get(categoria, {}).get(lingua, categoria.title())
+        titolo = f"{CATEGORIA_EMOJI.get(categoria, '🎪')} {cat_label}"
+
+    # Query eventi
+    offset = pagina * EVENTI_PER_PAGINA
+    eventi = db.get_eventi_periodo(data_inizio, data_fine, limit=EVENTI_PER_PAGINA, offset=offset, categoria=categoria)
+    totale = db.get_eventi_count_periodo(data_inizio, data_fine, categoria=categoria)
+    totale_pagine = (totale + EVENTI_PER_PAGINA - 1) // EVENTI_PER_PAGINA
+
+    text = f"🎪 <b>{titolo}</b>\n"
+    if totale > 0:
+        text += f"<i>{totale} eventi</i>\n\n"
+    else:
+        nessuno = {"it": "Nessun evento in questo periodo.", "en": "No events in this period.", "de": "Keine Veranstaltungen in diesem Zeitraum."}
+        text += nessuno.get(lingua, nessuno["it"])
+
+    # Lista eventi con numeri progressivi
+    numero_emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    for i, evento in enumerate(eventi):
+        text += _format_evento_lista(evento, lingua, numero=i+1) + "\n\n"
+
+    buttons = []
+
+    # Riga 1: Bottoni numerati per dettagli
+    if eventi:
+        num_buttons = []
+        for i, evento in enumerate(eventi):
+            evento_id = evento.get("id")
+            num_buttons.append(InlineKeyboardButton(numero_emoji[i], callback_data=f"evt_detail_{evento_id}"))
+        buttons.append(num_buttons)
+
+    # Riga 2: Paginazione
+    if totale_pagine > 1:
+        nav_buttons = []
+        if pagina > 0:
+            if categoria:
+                nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"evt_cat_{categoria}_p{pagina-1}"))
+            else:
+                nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"evt_list_{periodo}_p{pagina-1}"))
+
+        nav_buttons.append(InlineKeyboardButton(f"{pagina+1}/{totale_pagine}", callback_data="noop"))
+
+        if pagina < totale_pagine - 1:
+            if categoria:
+                nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"evt_cat_{categoria}_p{pagina+1}"))
+            else:
+                nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"evt_list_{periodo}_p{pagina+1}"))
+
+        buttons.append(nav_buttons)
+
+    # Riga 3: Bottone indietro
+    btn_back = {"it": "◀️ Eventi", "en": "◀️ Events", "de": "◀️ Events"}
+    buttons.append([InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data="evt_home")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    await edit_message_safe(query, text=text, reply_markup=keyboard)
+
+
+async def handle_eventi_categorie(context, chat_id: int, lingua: str, query):
+    """
+    CATEGORIE - Mostra categorie con conteggio.
+    Callback: evt_categoria
+    """
+    if query:
+        await query.answer()
+
+    titoli = {"it": "🏷️ <b>Categorie Eventi</b>", "en": "🏷️ <b>Event Categories</b>", "de": "🏷️ <b>Veranstaltungskategorien</b>"}
+    sottotitoli = {"it": "Scegli una categoria:", "en": "Choose a category:", "de": "Wählen Sie eine Kategorie:"}
+
+    text = titoli.get(lingua, titoli["it"]) + "\n"
+    text += f"<i>{sottotitoli.get(lingua, sottotitoli['it'])}</i>\n"
+
+    categorie = db.get_categorie_eventi()
+
+    buttons = []
+    for cat_info in categorie:
+        cat = cat_info["categoria"]
+        count = cat_info["count"]
+        emoji = CATEGORIA_EMOJI.get(cat, "🎪")
+        label = CATEGORIA_LABELS.get(cat, {}).get(lingua, cat.title())
+        buttons.append([InlineKeyboardButton(f"{emoji} {label} ({count})", callback_data=f"evt_cat_{cat}_p0")])
+
+    if not buttons:
+        nessuna = {"it": "\nNessuna categoria con eventi attivi.", "en": "\nNo categories with active events.", "de": "\nKeine Kategorien mit aktiven Veranstaltungen."}
+        text += nessuna.get(lingua, nessuna["it"])
+
+    btn_back = {"it": "◀️ Eventi", "en": "◀️ Events", "de": "◀️ Events"}
+    buttons.append([InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data="evt_home")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    await edit_message_safe(query, text=text, reply_markup=keyboard)
+
+
+async def handle_evento_dettaglio(context, chat_id: int, lingua: str, query, evento_id: int):
+    """
+    DETTAGLIO EVENTO - Mostra info complete.
+    Callback: evt_detail_{id}
+    """
+    import urllib.parse
+
+    if query:
+        await query.answer()
+
+    evento = db.get_evento_by_id(evento_id)
+    if not evento:
+        error = {"it": "⚠️ Evento non trovato.", "en": "⚠️ Event not found.", "de": "⚠️ Veranstaltung nicht gefunden."}
+        await edit_message_safe(query, text=error.get(lingua, error["it"]))
+        return
+
+    titolo = evento.get(f"titolo_{lingua}") or evento.get("titolo_it", "Evento")
+    descrizione = evento.get(f"descrizione_{lingua}") or evento.get("descrizione_it", "")
+    data_inizio = evento.get("data_inizio", "")
+    data_fine = evento.get("data_fine", "")
+    luogo = evento.get("luogo", "")
+    indirizzo = evento.get("indirizzo", "")
+    categoria = evento.get("categoria", "altro")
+
+    # Formatta data
+    from datetime import date
+    mesi_short = {"it": ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "Ott", "Nov", "Dic"],
+                  "en": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+                  "de": ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]}
+    giorni = {"it": ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"],
+              "en": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+              "de": ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]}
+
+    try:
+        d_inizio = date.fromisoformat(data_inizio)
+        d_fine = date.fromisoformat(data_fine) if data_fine else d_inizio
+
+        if d_inizio == d_fine:
+            giorno_nome = giorni.get(lingua, giorni["it"])[d_inizio.weekday()]
+            mese_nome = mesi_short.get(lingua, mesi_short["it"])[d_inizio.month - 1]
+            data_str = f"{giorno_nome} {d_inizio.day} {mese_nome} {d_inizio.year}"
+        else:
+            mese_inizio = mesi_short.get(lingua, mesi_short["it"])[d_inizio.month - 1]
+            mese_fine = mesi_short.get(lingua, mesi_short["it"])[d_fine.month - 1]
+            dal = {"it": "Dal", "en": "From", "de": "Vom"}
+            al = {"it": "al", "en": "to", "de": "bis"}
+            data_str = f"{dal.get(lingua, dal['it'])} {d_inizio.day} {mese_inizio} {d_inizio.year} {al.get(lingua, al['it'])} {d_fine.day} {mese_fine} {d_fine.year}"
+    except:
+        data_str = data_inizio
+
+    emoji = CATEGORIA_EMOJI.get(categoria, "🎪")
+
+    text = f"{emoji} <b>{titolo}</b>\n\n"
+    text += f"📅 {data_str}\n"
+    if luogo:
+        text += f"📍 {luogo}\n"
+
+    # Costruisci URL evento se disponibile
+    evento_url = None
+    if evento.get('url'):
+        evento_url = COMUNE_BASE + evento.get('url')
+
+    if descrizione:
+        text += f"\n{descrizione}\n"
+    else:
+        info_fallback = {"it": "ℹ️ Dettagli completi sul sito del Comune",
+                         "en": "ℹ️ Full details on the Municipality website",
+                         "de": "ℹ️ Vollständige Details auf der Website der Gemeinde"}
+        text += f"\n{info_fallback.get(lingua, info_fallback['it'])}\n"
+        if evento_url:
+            text += f"🔗 {evento_url}\n"
+
+    text += "\n🦭 <i>SLAPPY</i>"
+
+    # Bottoni su una riga: [Maps] [Condividi]
+    buttons = []
+    row1 = []
+
+    if indirizzo or luogo:
+        maps_query = urllib.parse.quote(indirizzo or luogo)
+        maps_url = f"https://www.google.com/maps/search/?api=1&query={maps_query}"
+        row1.append(InlineKeyboardButton("🗺️ Maps", url=maps_url))
+
+    share_text = urllib.parse.quote(f"🎪 {titolo}\n📅 {data_str}\n📍 {luogo or ''}")
+    share_url = f"https://t.me/share/url?url=&text={share_text}"
+    row1.append(InlineKeyboardButton("📤 Condividi", url=share_url))
+
+    if row1:
+        buttons.append(row1)
+
+    # Bottone sito Comune (solo se URL esiste)
+    if evento_url:
+        buttons.append([InlineKeyboardButton("🔗 Sito Comune", url=evento_url)])
+
+    # Indietro
+    btn_back = {"it": "◀️ Eventi", "en": "◀️ Events", "de": "◀️ Events"}
+    buttons.append([InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data="evt_home")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    await edit_message_safe(query, text=text, reply_markup=keyboard)
+
+
+async def handle_eventi_calendario(context, chat_id: int, lingua: str, query, anno: int = None, mese: int = None):
+    """
+    CALENDARIO MESE - Griglia con giorni che hanno eventi.
+    Callback: evt_cal o evt_cal_{anno}_{mese}
+    """
+    from datetime import date
+    import calendar
+
+    if query:
+        await query.answer()
+
+    oggi = date.today()
+    if anno is None:
+        anno = oggi.year
+    if mese is None:
+        mese = oggi.month
+
+    # Nomi mesi
+    mesi_nomi = {
+        "it": ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno", "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"],
+        "en": ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+        "de": ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"]
+    }
+
+    nome_mese = mesi_nomi.get(lingua, mesi_nomi["it"])[mese - 1]
+
+    titoli = {"it": "🗓️ <b>Calendario Eventi</b>", "en": "🗓️ <b>Events Calendar</b>", "de": "🗓️ <b>Veranstaltungskalender</b>"}
+
+    text = titoli.get(lingua, titoli["it"]) + "\n"
+    text += f"<b>{nome_mese} {anno}</b>\n\n"
+
+    # Giorni con eventi
+    giorni_eventi = db.get_giorni_con_eventi(anno, mese)
+
+    # Header giorni settimana
+    giorni_header = {"it": "L  M  M  G  V  S  D", "en": "M  T  W  T  F  S  S", "de": "M  D  M  D  F  S  S"}
+    text += f"<code>{giorni_header.get(lingua, giorni_header['it'])}</code>\n"
+
+    # Griglia calendario
+    cal = calendar.monthcalendar(anno, mese)
+    for settimana in cal:
+        riga = ""
+        for giorno in settimana:
+            if giorno == 0:
+                riga += "   "
+            elif giorno in giorni_eventi:
+                riga += f"<b>{giorno:2d}</b> "
+            elif date(anno, mese, giorno) == oggi:
+                riga += f"<u>{giorno:2d}</u> "
+            else:
+                riga += f"{giorno:2d} "
+        text += f"<code>{riga}</code>\n"
+
+    legend = {"it": "\n<b>Grassetto</b> = giorni con eventi", "en": "\n<b>Bold</b> = days with events", "de": "\n<b>Fett</b> = Tage mit Veranstaltungen"}
+    text += legend.get(lingua, legend["it"])
+
+    # Bottoni giorni con eventi (max 8)
+    buttons = []
+    row = []
+    for giorno in giorni_eventi[:8]:
+        row.append(InlineKeyboardButton(f"{giorno}", callback_data=f"evt_cal_giorno_{anno}_{mese}_{giorno}"))
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    # Navigazione mesi
+    nav = []
+    # Mese precedente
+    if mese == 1:
+        prev_anno, prev_mese = anno - 1, 12
+    else:
+        prev_anno, prev_mese = anno, mese - 1
+    nav.append(InlineKeyboardButton("◀️", callback_data=f"evt_cal_{prev_anno}_{prev_mese}"))
+
+    # Mese successivo
+    if mese == 12:
+        next_anno, next_mese = anno + 1, 1
+    else:
+        next_anno, next_mese = anno, mese + 1
+    nav.append(InlineKeyboardButton("▶️", callback_data=f"evt_cal_{next_anno}_{next_mese}"))
+    buttons.append(nav)
+
+    # Indietro
+    btn_back = {"it": "◀️ Eventi", "en": "◀️ Events", "de": "◀️ Events"}
+    buttons.append([InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data="evt_home")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    await edit_message_safe(query, text=text, reply_markup=keyboard)
+
+
+async def handle_eventi_giorno(context, chat_id: int, lingua: str, query, anno: int, mese: int, giorno: int):
+    """
+    EVENTI DI UN GIORNO SPECIFICO dal calendario.
+    Callback: evt_cal_giorno_{anno}_{mese}_{giorno}
+    """
+    from datetime import date
+
+    if query:
+        await query.answer()
+
+    data = date(anno, mese, giorno).isoformat()
+    eventi = db.get_eventi_giorno(data)
+
+    # Formatta data
+    giorni_nomi = {"it": ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"],
+                   "en": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+                   "de": ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]}
+    mesi_nomi = {"it": ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno", "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"],
+                 "en": ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+                 "de": ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"]}
+
+    d = date(anno, mese, giorno)
+    giorno_nome = giorni_nomi.get(lingua, giorni_nomi["it"])[d.weekday()]
+    mese_nome = mesi_nomi.get(lingua, mesi_nomi["it"])[mese - 1]
+
+    text = f"🗓️ <b>{giorno_nome} {giorno} {mese_nome}</b>\n\n"
+
+    buttons = []
+
+    if not eventi:
+        nessuno = {"it": "Nessun evento in questo giorno.", "en": "No events on this day.", "de": "Keine Veranstaltungen an diesem Tag."}
+        text += nessuno.get(lingua, nessuno["it"])
+    else:
+        text += f"<i>{len(eventi)} eventi</i>\n\n"
+        numero_emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        for i, evento in enumerate(eventi[:10]):
+            text += _format_evento_lista(evento, lingua, numero=i+1) + "\n\n"
+
+        # Riga 1: Bottoni numerati per dettagli
+        num_buttons = []
+        for i, evento in enumerate(eventi[:10]):
+            evento_id = evento.get("id")
+            num_buttons.append(InlineKeyboardButton(numero_emoji[i], callback_data=f"evt_detail_{evento_id}"))
+        buttons.append(num_buttons)
+
+    # Bottone indietro al calendario
+    btn_back = {"it": "◀️ Calendario", "en": "◀️ Calendar", "de": "◀️ Kalender"}
+    buttons.append([InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data=f"evt_cal_{anno}_{mese}")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    await edit_message_safe(query, text=text, reply_markup=keyboard)
 
 
 async def handle_trasporti(context, chat_id: int, lingua: str, query=None):

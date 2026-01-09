@@ -377,3 +377,238 @@ def get_stats() -> dict:
         logger.error(f"Errore get_stats eventi: {e}")
 
     return stats
+
+
+def get_eventi_prossimi(giorni: int = 7, limit: int = None) -> list:
+    """
+    Restituisce eventi attivi da oggi ai prossimi N giorni.
+
+    Args:
+        giorni: numero di giorni da oggi (default 7)
+        limit: limite risultati (None = tutti)
+
+    Returns:
+        Lista di eventi ordinati per data_inizio
+    """
+    from datetime import date, timedelta
+
+    try:
+        oggi = date.today()
+        fine_periodo = oggi + timedelta(days=giorni)
+
+        query = supabase.table("eventi") \
+            .select("*") \
+            .lte("data_inizio", fine_periodo.isoformat()) \
+            .gte("data_fine", oggi.isoformat()) \
+            .eq("attivo", True) \
+            .order("data_inizio")
+
+        if limit:
+            query = query.limit(limit)
+
+        response = query.execute()
+
+        if response.data:
+            return response.data
+        return []
+    except Exception as e:
+        logger.error(f"Errore get_eventi_prossimi: {e}")
+        return []
+
+
+def get_eventi_count(giorni: int = 7) -> int:
+    """Conta eventi attivi nei prossimi N giorni."""
+    from datetime import date, timedelta
+
+    try:
+        oggi = date.today()
+        fine_periodo = oggi + timedelta(days=giorni)
+
+        response = supabase.table("eventi") \
+            .select("id", count="exact") \
+            .lte("data_inizio", fine_periodo.isoformat()) \
+            .gte("data_fine", oggi.isoformat()) \
+            .eq("attivo", True) \
+            .execute()
+
+        return response.count or 0
+    except Exception as e:
+        logger.error(f"Errore get_eventi_count: {e}")
+        return 0
+
+
+def get_evento_imperdibile() -> Optional[dict]:
+    """Restituisce l'evento imperdibile di oggi (se c'è)."""
+    from datetime import date
+
+    try:
+        oggi = date.today().isoformat()
+
+        response = supabase.table("eventi") \
+            .select("*") \
+            .lte("data_inizio", oggi) \
+            .gte("data_fine", oggi) \
+            .eq("attivo", True) \
+            .eq("imperdibile", True) \
+            .limit(1) \
+            .execute()
+
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Errore get_evento_imperdibile: {e}")
+        return None
+
+
+def get_eventi_periodo(data_inizio: str, data_fine: str, limit: int = None, offset: int = 0, categoria: str = None) -> list:
+    """
+    Restituisce eventi in un periodo specifico con paginazione.
+
+    Args:
+        data_inizio: data inizio periodo (YYYY-MM-DD)
+        data_fine: data fine periodo (YYYY-MM-DD)
+        limit: limite risultati per pagina
+        offset: offset per paginazione
+        categoria: filtra per categoria (opzionale)
+    """
+    try:
+        query = supabase.table("eventi") \
+            .select("*") \
+            .lte("data_inizio", data_fine) \
+            .gte("data_fine", data_inizio) \
+            .eq("attivo", True) \
+            .order("data_inizio")
+
+        if categoria:
+            query = query.eq("categoria", categoria)
+
+        if limit:
+            query = query.limit(limit)
+
+        if offset:
+            query = query.offset(offset)
+
+        response = query.execute()
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_eventi_periodo: {e}")
+        return []
+
+
+def get_eventi_count_periodo(data_inizio: str, data_fine: str, categoria: str = None) -> int:
+    """Conta eventi in un periodo specifico."""
+    try:
+        query = supabase.table("eventi") \
+            .select("id", count="exact") \
+            .lte("data_inizio", data_fine) \
+            .gte("data_fine", data_inizio) \
+            .eq("attivo", True)
+
+        if categoria:
+            query = query.eq("categoria", categoria)
+
+        response = query.execute()
+        return response.count or 0
+    except Exception as e:
+        logger.error(f"Errore get_eventi_count_periodo: {e}")
+        return 0
+
+
+def get_evento_by_id(evento_id: int) -> Optional[dict]:
+    """Restituisce un evento per ID."""
+    try:
+        response = supabase.table("eventi") \
+            .select("*") \
+            .eq("id", evento_id) \
+            .eq("attivo", True) \
+            .limit(1) \
+            .execute()
+
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Errore get_evento_by_id: {e}")
+        return None
+
+
+def get_eventi_giorno(data: str) -> list:
+    """Restituisce tutti gli eventi di un giorno specifico."""
+    try:
+        response = supabase.table("eventi") \
+            .select("*") \
+            .lte("data_inizio", data) \
+            .gte("data_fine", data) \
+            .eq("attivo", True) \
+            .order("orario") \
+            .execute()
+
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_eventi_giorno: {e}")
+        return []
+
+
+def get_giorni_con_eventi(anno: int, mese: int) -> list:
+    """Restituisce lista di giorni del mese che hanno eventi."""
+    from datetime import date
+    import calendar
+
+    try:
+        # Primo e ultimo giorno del mese
+        primo_giorno = date(anno, mese, 1)
+        ultimo_giorno = date(anno, mese, calendar.monthrange(anno, mese)[1])
+
+        response = supabase.table("eventi") \
+            .select("data_inizio, data_fine") \
+            .lte("data_inizio", ultimo_giorno.isoformat()) \
+            .gte("data_fine", primo_giorno.isoformat()) \
+            .eq("attivo", True) \
+            .execute()
+
+        giorni_con_eventi = set()
+        if response.data:
+            for evento in response.data:
+                # Aggiungi tutti i giorni coperti dall'evento
+                try:
+                    inizio = date.fromisoformat(evento["data_inizio"])
+                    fine = date.fromisoformat(evento["data_fine"])
+                    current = max(inizio, primo_giorno)
+                    end = min(fine, ultimo_giorno)
+                    while current <= end:
+                        if current.month == mese:
+                            giorni_con_eventi.add(current.day)
+                        current = date(current.year, current.month, current.day + 1) if current.day < 28 else current.replace(day=current.day + 1)
+                except:
+                    pass
+
+        return sorted(list(giorni_con_eventi))
+    except Exception as e:
+        logger.error(f"Errore get_giorni_con_eventi: {e}")
+        return []
+
+
+def get_categorie_eventi() -> list:
+    """Restituisce le categorie disponibili con conteggio eventi attivi."""
+    from datetime import date
+
+    categorie = ["mercato", "sagra", "musica", "cultura", "sport", "famiglia"]
+    oggi = date.today().isoformat()
+    result = []
+
+    for cat in categorie:
+        try:
+            response = supabase.table("eventi") \
+                .select("id", count="exact") \
+                .gte("data_fine", oggi) \
+                .eq("attivo", True) \
+                .eq("categoria", cat) \
+                .execute()
+            count = response.count or 0
+            if count > 0:
+                result.append({"categoria": cat, "count": count})
+        except:
+            pass
+
+    return result
