@@ -612,3 +612,385 @@ def get_categorie_eventi() -> list:
             pass
 
     return result
+
+
+# ============ TRASPORTI ============
+
+def get_operatori_attivi(tipo: str = None) -> list:
+    """
+    Restituisce operatori attivi, opzionalmente filtrati per tipo.
+    tipo: 'bus' o 'ferry' (None = tutti)
+    """
+    try:
+        query = supabase.table("operatori") \
+            .select("*") \
+            .eq("attivo", True) \
+            .order("nome")
+
+        if tipo:
+            query = query.eq("tipo", tipo)
+
+        response = query.execute()
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_operatori_attivi: {e}")
+        return []
+
+
+def get_operatore_by_id(operatore_id: int) -> Optional[dict]:
+    """Restituisce un operatore specifico per ID."""
+    try:
+        response = supabase.table("operatori") \
+            .select("*") \
+            .eq("id", operatore_id) \
+            .limit(1) \
+            .execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Errore get_operatore_by_id: {e}")
+        return None
+
+
+def get_linee_by_tipo(tipo: str) -> list:
+    """Restituisce tutte le linee attive di un tipo (bus/traghetto)."""
+    try:
+        response = supabase.table("linee") \
+            .select("*, operatori(nome, sito_web)") \
+            .eq("tipo", tipo) \
+            .eq("attivo", True) \
+            .order("codice") \
+            .execute()
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_linee_by_tipo: {e}")
+        return []
+
+
+def get_linea_by_id(linea_id: int) -> Optional[dict]:
+    """Restituisce una linea specifica per ID."""
+    try:
+        response = supabase.table("linee") \
+            .select("*, operatori(nome, sito_web)") \
+            .eq("id", linea_id) \
+            .eq("attivo", True) \
+            .limit(1) \
+            .execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Errore get_linea_by_id: {e}")
+        return None
+
+
+def get_zone_attive() -> list:
+    """Restituisce tutte le zone attive ordinate geograficamente."""
+    try:
+        response = supabase.table("zone") \
+            .select("*") \
+            .eq("attivo", True) \
+            .order("ordine_geografico") \
+            .execute()
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_zone_attive: {e}")
+        return []
+
+
+def get_destinazioni_attive() -> list:
+    """Restituisce tutte le destinazioni attive."""
+    try:
+        response = supabase.table("destinazioni") \
+            .select("*") \
+            .eq("attivo", True) \
+            .order("ordine") \
+            .execute()
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_destinazioni_attive: {e}")
+        return []
+
+
+def get_destinazione_by_id(destinazione_id: int) -> Optional[dict]:
+    """Restituisce una destinazione specifica per ID."""
+    try:
+        response = supabase.table("destinazioni") \
+            .select("*") \
+            .eq("id", destinazione_id) \
+            .eq("attivo", True) \
+            .limit(1) \
+            .execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Errore get_destinazione_by_id: {e}")
+        return None
+
+
+def get_percorsi_by_destinazione(destinazione_codice: str) -> list:
+    """Restituisce tutti i percorsi per una destinazione (by codice)."""
+    try:
+        response = supabase.table("percorsi") \
+            .select("*, linee(nome, tipo, operatori(nome, link))") \
+            .eq("destinazione_codice", destinazione_codice) \
+            .eq("attivo", True) \
+            .order("durata") \
+            .execute()
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_percorsi_by_destinazione: {e}")
+        return []
+
+
+def get_tariffe_by_operatore(operatore_id: int) -> list:
+    """Restituisce tariffe di un operatore."""
+    try:
+        response = supabase.table("tariffe") \
+            .select("*") \
+            .eq("operatore_id", operatore_id) \
+            .eq("attivo", True) \
+            .order("prezzo") \
+            .execute()
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_tariffe_by_operatore: {e}")
+        return []
+
+
+def get_tariffe_by_linea(linea_id: int) -> list:
+    """Restituisce tariffe di una linea specifica."""
+    try:
+        response = supabase.table("tariffe") \
+            .select("*") \
+            .eq("linea_id", linea_id) \
+            .eq("attivo", True) \
+            .order("prezzo") \
+            .execute()
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_tariffe_by_linea: {e}")
+        return []
+
+
+# ============ ORARI BUS REALI ============
+
+def get_prossimi_orari_bus(linea_codice: str, fermata_nome: str, direzione: str = "andata",
+                          ora_partenza: str = None, tipo_giorno: str = None, limit: int = 3) -> list:
+    """
+    Restituisce i prossimi orari bus dalla tabella orari_bus.
+
+    Args:
+        linea_codice: es. "23A", "96"
+        fermata_nome: nome fermata
+        direzione: "andata" o "ritorno"
+        ora_partenza: orario minimo (HH:MM), se None usa ora corrente
+        tipo_giorno: "feriale", "festivo", "sabato" - se None determina automaticamente
+        limit: numero massimo di risultati
+
+    Returns:
+        Lista di orari [{ora: "HH:MM", ...}, ...]
+    """
+    from datetime import datetime
+    import pytz
+
+    try:
+        rome_tz = pytz.timezone("Europe/Rome")
+        now = datetime.now(rome_tz)
+
+        # Determina ora partenza (formato HH:MM:SS per database)
+        if ora_partenza:
+            # Aggiungi :00 se manca
+            ora_min = ora_partenza if len(ora_partenza) > 5 else f"{ora_partenza}:00"
+        else:
+            ora_min = now.strftime("%H:%M:%S")
+
+        # tipo_giorno nel database è "fF" (tutti i giorni feriali/festivi)
+        # Per ora usiamo sempre "fF" finché non ci sono dati separati
+        tipo_giorno_db = "fF"
+
+        # LOG DETTAGLIATO QUERY
+        logger.info(f"[ORARI_BUS] Query: linea={linea_codice}, fermata={fermata_nome}, dir={direzione}, tipo={tipo_giorno_db}, ora>={ora_min}, limit={limit}")
+
+        response = supabase.table("orari_bus") \
+            .select("*") \
+            .eq("linea_codice", linea_codice) \
+            .eq("fermata_nome", fermata_nome) \
+            .eq("direzione", direzione) \
+            .eq("tipo_giorno", tipo_giorno_db) \
+            .gte("ora", ora_min) \
+            .order("ora") \
+            .limit(limit) \
+            .execute()
+
+        # LOG RISULTATO
+        logger.info(f"[ORARI_BUS] Risultato: {len(response.data) if response.data else 0} righe - {response.data}")
+
+        # Normalizza formato ora da HH:MM:SS a HH:MM
+        def normalize_ora(orario_dict):
+            if orario_dict and "ora" in orario_dict:
+                ora_raw = orario_dict["ora"]
+                if ora_raw and len(ora_raw) > 5:
+                    orario_dict["ora"] = ora_raw[:5]  # "16:30:00" -> "16:30"
+            return orario_dict
+
+        if response.data:
+            risultati = [normalize_ora(o) for o in response.data]
+            logger.info(f"[ORARI_BUS] Orari normalizzati: {[r.get('ora') for r in risultati]}")
+            return risultati
+
+        # Se non ci sono più corse oggi, cerca le prime di domani
+        if not response.data or len(response.data) < limit:
+            response_domani = supabase.table("orari_bus") \
+                .select("*") \
+                .eq("linea_codice", linea_codice) \
+                .eq("fermata_nome", fermata_nome) \
+                .eq("direzione", direzione) \
+                .eq("tipo_giorno", tipo_giorno_db) \
+                .order("ora") \
+                .limit(limit - len(response.data or [])) \
+                .execute()
+
+            orari_domani = []
+            if response_domani.data:
+                for orario in response_domani.data:
+                    orario["domani"] = True
+                    orari_domani.append(normalize_ora(orario))
+
+            return [normalize_ora(o) for o in (response.data or [])] + orari_domani
+
+        return [normalize_ora(o) for o in (response.data or [])]
+
+    except Exception as e:
+        logger.error(f"Errore get_prossimi_orari_bus: {e}")
+        return []
+
+
+def get_fermata_bus(linea_codice: str, fermata_nome: str) -> Optional[dict]:
+    """
+    Restituisce info su una fermata specifica dalla tabella fermate_bus.
+
+    Returns:
+        {nome, zona, ordine, tempo_da_capolinea, ...}
+    """
+    try:
+        response = supabase.table("fermate_bus") \
+            .select("*") \
+            .eq("linea_codice", linea_codice) \
+            .eq("nome", fermata_nome) \
+            .limit(1) \
+            .execute()
+
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Errore get_fermata_bus: {e}")
+        return None
+
+
+def get_fermate_linea(linea_codice: str, direzione: str = "andata") -> list:
+    """
+    Restituisce tutte le fermate di una linea in ordine.
+
+    Returns:
+        Lista di fermate ordinate per ordine
+    """
+    try:
+        response = supabase.table("fermate_bus") \
+            .select("*") \
+            .eq("linea_codice", linea_codice) \
+            .order("ordine") \
+            .execute()
+
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_fermate_linea: {e}")
+        return []
+
+
+def get_tempo_tra_fermate(linea_codice: str, fermata_partenza: str, fermata_arrivo: str) -> Optional[int]:
+    """
+    Calcola il tempo di percorrenza tra due fermate usando tempo_da_capolinea.
+
+    Returns:
+        Tempo in minuti, o None se non trovato
+    """
+    try:
+        fermata_p = get_fermata_bus(linea_codice, fermata_partenza)
+        fermata_a = get_fermata_bus(linea_codice, fermata_arrivo)
+
+        if fermata_p and fermata_a:
+            tempo_p = fermata_p.get("tempo_da_capolinea", 0) or 0
+            tempo_a = fermata_a.get("tempo_da_capolinea", 0) or 0
+            return abs(tempo_a - tempo_p)
+        return None
+    except Exception as e:
+        logger.error(f"Errore get_tempo_tra_fermate: {e}")
+        return None
+
+
+def get_linee_per_zona(zona_codice: str) -> list:
+    """
+    Restituisce le linee bus che servono una zona specifica.
+
+    Returns:
+        Lista di linee [{linea_codice, fermata_nome, ...}, ...]
+    """
+    try:
+        response = supabase.table("fermate_bus") \
+            .select("linea_codice, nome, tempo_da_capolinea") \
+            .eq("zona", zona_codice) \
+            .order("linea_codice") \
+            .execute()
+
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_linee_per_zona: {e}")
+        return []
+
+
+def calcola_arrivo_fermata(ora_partenza: str, linea_codice: str, fermata_partenza: str, fermata_arrivo: str) -> Optional[str]:
+    """
+    Calcola l'orario di arrivo a una fermata dato l'orario di partenza.
+
+    Args:
+        ora_partenza: orario partenza (HH:MM)
+        linea_codice: codice linea
+        fermata_partenza: nome fermata partenza
+        fermata_arrivo: nome fermata arrivo
+
+    Returns:
+        Orario arrivo (HH:MM) o None
+    """
+    from datetime import datetime, timedelta
+
+    try:
+        tempo = get_tempo_tra_fermate(linea_codice, fermata_partenza, fermata_arrivo)
+        if tempo is None:
+            return None
+
+        # Parse ora partenza
+        h, m = map(int, ora_partenza.split(":"))
+        dt_partenza = datetime(2000, 1, 1, h, m)
+        dt_arrivo = dt_partenza + timedelta(minutes=tempo)
+
+        return dt_arrivo.strftime("%H:%M")
+    except Exception as e:
+        logger.error(f"Errore calcola_arrivo_fermata: {e}")
+        return None
+
+def get_orari_traghetto(linea_codice: str, fermata_nome: str, direzione: str = "andata", ora_partenza: str = None, limit: int = 5):
+    """Ritorna i prossimi orari di un traghetto ACTV."""
+    try:
+        query = supabase.table("orari_bus").select("*").eq("linea_codice", linea_codice).eq("fermata_nome", fermata_nome).eq("direzione", direzione).eq("attivo", True)
+        if ora_partenza:
+            query = query.gte("ora", ora_partenza)
+        query = query.order("ora").limit(limit)
+        result = query.execute()
+        return result.data or []
+    except Exception as e:
+        logger.error(f"Errore get_orari_traghetto: {e}")
+        return []
