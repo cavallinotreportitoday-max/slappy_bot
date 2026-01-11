@@ -1217,6 +1217,41 @@ async def action_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, update_i
 
     # ============ FINE ROUTING TRASPORTI ============
 
+    # ============ ROUTING FORTINI ============
+    if callback_data == "menu_fortini":
+        await handle_fortini(context, chat_id, lingua, query)
+        db.update_user(chat_id, {"last_update_id": update_id})
+        return
+
+    if callback_data == "fort_zone":
+        await handle_fortini_zone(context, chat_id, lingua, query)
+        db.update_user(chat_id, {"last_update_id": update_id})
+        return
+
+    if callback_data.startswith("fort_zona_"):
+        zona_key = callback_data.replace("fort_zona_", "")
+        await handle_fortini_lista(context, chat_id, lingua, query, zona_key)
+        db.update_user(chat_id, {"last_update_id": update_id})
+        return
+
+    if callback_data.startswith("fort_detail_"):
+        fortino_id = callback_data.replace("fort_detail_", "")
+        await handle_fortini_dettaglio(context, chat_id, lingua, query, fortino_id)
+        db.update_user(chat_id, {"last_update_id": update_id})
+        return
+
+    if callback_data == "fort_percorsi":
+        await handle_percorsi_lista(context, chat_id, lingua, query)
+        db.update_user(chat_id, {"last_update_id": update_id})
+        return
+
+    if callback_data.startswith("fort_percorso_"):
+        percorso_id = callback_data.replace("fort_percorso_", "")
+        await handle_percorsi_dettaglio(context, chat_id, lingua, query, percorso_id)
+        db.update_user(chat_id, {"last_update_id": update_id})
+        return
+    # ============ FINE ROUTING FORTINI ============
+
     if menu_key == "ristoranti":
         await handle_ristoranti(context, chat_id, lingua, query)
         db.update_user(chat_id, {"last_update_id": update_id})
@@ -1466,10 +1501,13 @@ def get_menu_keyboard(lingua: str) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("💡 Idee", callback_data="menu_idee"),
-            InlineKeyboardButton("🚌 Trasporti", callback_data="menu_trasporti")
+            InlineKeyboardButton("🏰 Fortini", callback_data="menu_fortini")
         ],
         [
-            InlineKeyboardButton("🍽️ Ristoranti", callback_data="menu_ristoranti"),
+            InlineKeyboardButton("🚌 Trasporti", callback_data="menu_trasporti"),
+            InlineKeyboardButton("🍽️ Ristoranti", callback_data="menu_ristoranti")
+        ],
+        [
             InlineKeyboardButton("🆘 Emergenza", callback_data="menu_sos")
         ]
     ])
@@ -2594,128 +2632,324 @@ async def handle_spiagge(context, chat_id: int, lingua: str, query=None):
 
 async def handle_fortini(context, chat_id: int, lingua: str, query=None):
     """
-    Mostra informazioni sui fortini storici.
+    Menu principale Fortini: 🏰 Fortini, 🚴 Percorsi, ◀️ Indietro
     """
-    # Rispondi al callback SUBITO
     if query:
         await query.answer()
 
-    text = db.get_text("info_fortini", lingua)
+    header = {
+        "it": "🏰 <b>Fortini di Cavallino-Treporti</b>",
+        "en": "🏰 <b>Forts of Cavallino-Treporti</b>",
+        "de": "🏰 <b>Festungen von Cavallino-Treporti</b>"
+    }
 
-    if text == "info_fortini":
-        fallback = {
-            "it": """🏰 <b>Fortini di Cavallino-Treporti</b>
+    intro = {
+        "it": "Sistema difensivo storico con 11 fortificazioni dalla Serenissima alla Grande Guerra.",
+        "en": "Historic defense system with 11 fortifications from the Serenissima to the Great War.",
+        "de": "Historisches Verteidigungssystem mit 11 Festungen von der Serenissima bis zum Ersten Weltkrieg."
+    }
 
-Sistema difensivo storico della Serenissima e dell'era moderna.
+    text = f"{header.get(lingua, header['it'])}\n\n{intro.get(lingua, intro['it'])}"
 
-🏰 <b>Batteria Amalfi</b>
-• Costruita nel 1917
-• Museo all'aperto visitabile
-• Vista panoramica sulla bocca di porto
-
-🏰 <b>Batteria Pisani</b>
-• Fortificazione austro-ungarica
-• Ben conservata
-• Percorsi guidati disponibili
-
-🏰 <b>Batteria Vettor Pisani</b>
-• Struttura della Grande Guerra
-• Torrette e casematte originali
-• Interessante per appassionati di storia
-
-🏰 <b>Forte Treporti</b>
-• Epoca napoleonica
-• Recentemente restaurato
-• Eventi culturali estivi
-
-📍 <b>Come visitare:</b>
-• Percorso ciclabile collega tutti i fortini
-• Visite guidate su prenotazione
-• Ingresso gratuito o a offerta libera
-
-🚴 Consiglio: noleggia una bici e fai il "Giro dei Fortini"!""",
-            "en": """🏰 <b>Forts of Cavallino-Treporti</b>
-
-Historic defense system from the Serenissima and modern era.
-
-🏰 <b>Amalfi Battery</b>
-• Built in 1917
-• Open-air museum
-• Panoramic view of the port entrance
-
-🏰 <b>Pisani Battery</b>
-• Austro-Hungarian fortification
-• Well preserved
-• Guided tours available
-
-🏰 <b>Vettor Pisani Battery</b>
-• Great War structure
-• Original turrets and casemates
-• Interesting for history enthusiasts
-
-🏰 <b>Treporti Fort</b>
-• Napoleonic era
-• Recently restored
-• Summer cultural events
-
-📍 <b>How to visit:</b>
-• Cycle path connects all forts
-• Guided tours on reservation
-• Free entry or donation
-
-🚴 Tip: rent a bike and do the "Fort Tour"!""",
-            "de": """🏰 <b>Festungen von Cavallino-Treporti</b>
-
-Historisches Verteidigungssystem der Serenissima und der modernen Ära.
-
-🏰 <b>Batterie Amalfi</b>
-• Erbaut 1917
-• Freiluftmuseum
-• Panoramablick auf die Hafeneinfahrt
-
-🏰 <b>Batterie Pisani</b>
-• Österreichisch-ungarische Festung
-• Gut erhalten
-• Führungen verfügbar
-
-🏰 <b>Batterie Vettor Pisani</b>
-• Struktur aus dem Ersten Weltkrieg
-• Originale Türme und Kasematten
-• Interessant für Geschichtsliebhaber
-
-🏰 <b>Fort Treporti</b>
-• Napoleonische Ära
-• Kürzlich restauriert
-• Sommerliche Kulturveranstaltungen
-
-📍 <b>So besuchen Sie:</b>
-• Radweg verbindet alle Festungen
-• Führungen auf Reservierung
-• Freier Eintritt oder Spende
-
-🚴 Tipp: Mieten Sie ein Fahrrad und machen Sie die "Festungstour"!"""
-        }
-        text = fallback.get(lingua, fallback["it"])
+    btn_fortini = {"it": "🏰 Esplora per zona", "en": "🏰 Explore by area", "de": "🏰 Nach Gebiet erkunden"}
+    btn_percorsi = {"it": "🚴 Percorsi", "en": "🚴 Routes", "de": "🚴 Routen"}
+    btn_back = {"it": "◀️ Menu", "en": "◀️ Menu", "de": "◀️ Menü"}
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💡 Altre idee", callback_data="menu_idee")],
-        [InlineKeyboardButton("◀️ Menu", callback_data="menu_back")]
+        [InlineKeyboardButton(btn_fortini.get(lingua, btn_fortini["it"]), callback_data="fort_zone")],
+        [InlineKeyboardButton(btn_percorsi.get(lingua, btn_percorsi["it"]), callback_data="fort_percorsi")],
+        [InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data="menu_back")]
     ])
 
-    # Edita messaggio esistente invece di mandarne uno nuovo
     if query:
-        await query.edit_message_text(
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
     else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="HTML")
+
+
+# Zone per i fortini (8 zone)
+FORTINI_ZONE = [
+    "Cavallino", "Ca' di Valle", "Ca' Ballarin", "Ca' Pasquali",
+    "Ca' Vio", "Ca' Savio", "Treporti", "Punta Sabbioni"
+]
+
+
+async def handle_fortini_zone(context, chat_id: int, lingua: str, query=None):
+    """
+    Lista delle 8 zone con fortini.
+    """
+    if query:
+        await query.answer()
+
+    header = {
+        "it": "🏰 <b>Scegli la zona</b>",
+        "en": "🏰 <b>Choose the area</b>",
+        "de": "🏰 <b>Wählen Sie das Gebiet</b>"
+    }
+
+    text = header.get(lingua, header["it"])
+
+    buttons = []
+    for zona in FORTINI_ZONE:
+        # Creiamo callback-safe key (rimuoviamo apostrofi e spazi)
+        zona_key = zona.lower().replace("'", "").replace(" ", "_")
+        buttons.append([InlineKeyboardButton(f"📍 {zona}", callback_data=f"fort_zona_{zona_key}")])
+
+    btn_back = {"it": "◀️ Fortini", "en": "◀️ Forts", "de": "◀️ Festungen"}
+    buttons.append([InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data="menu_fortini")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+
+    if query:
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="HTML")
+
+
+def _zona_key_to_nome(zona_key: str) -> str:
+    """Converte zona_key in nome zona originale."""
+    mapping = {
+        "cavallino": "Cavallino",
+        "ca_di_valle": "Ca' di Valle",
+        "ca_ballarin": "Ca' Ballarin",
+        "ca_pasquali": "Ca' Pasquali",
+        "ca_vio": "Ca' Vio",
+        "ca_savio": "Ca' Savio",
+        "treporti": "Treporti",
+        "punta_sabbioni": "Punta Sabbioni"
+    }
+    return mapping.get(zona_key, zona_key)
+
+
+async def handle_fortini_lista(context, chat_id: int, lingua: str, query, zona_key: str):
+    """
+    Lista fortini di una zona specifica.
+    """
+    if query:
+        await query.answer()
+
+    zona_nome = _zona_key_to_nome(zona_key)
+    fortini = db.get_fortini_by_zona(zona_nome)
+
+    header = {
+        "it": f"🏰 <b>Fortini a {zona_nome}</b>",
+        "en": f"🏰 <b>Forts in {zona_nome}</b>",
+        "de": f"🏰 <b>Festungen in {zona_nome}</b>"
+    }
+
+    if not fortini:
+        no_fortini = {
+            "it": "Nessun fortino in questa zona.",
+            "en": "No forts in this area.",
+            "de": "Keine Festungen in diesem Gebiet."
+        }
+        text = f"{header.get(lingua, header['it'])}\n\n{no_fortini.get(lingua, no_fortini['it'])}"
+    else:
+        text = header.get(lingua, header["it"])
+
+    buttons = []
+    for fortino in fortini:
+        nome = fortino.get("nome", "Fortino")
+        fortino_id = fortino.get("id")
+        visitabile = fortino.get("visitabile", False)
+        emoji = "🏛️" if visitabile else "🏚️"
+        buttons.append([InlineKeyboardButton(f"{emoji} {nome}", callback_data=f"fort_detail_{fortino_id}")])
+
+    btn_back = {"it": "◀️ Zone", "en": "◀️ Areas", "de": "◀️ Gebiete"}
+    buttons.append([InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data="fort_zone")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+
+    if query:
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def handle_fortini_dettaglio(context, chat_id: int, lingua: str, query, fortino_id: str):
+    """
+    Scheda dettaglio singolo fortino con link Google Maps.
+    """
+    if query:
+        await query.answer()
+
+    fortino = db.get_fortino_by_id(fortino_id)
+
+    if not fortino:
+        error = {"it": "Fortino non trovato.", "en": "Fort not found.", "de": "Festung nicht gefunden."}
+        text = f"⚠️ {error.get(lingua, error['it'])}"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀️ Zone", callback_data="fort_zone")]
+        ])
+        if query:
+            await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+        return
+
+    nome = fortino.get("nome", "Fortino")
+    tipo = fortino.get("tipo", "")
+    zona = fortino.get("zona", "")
+    lat = fortino.get("lat")
+    lng = fortino.get("lng")
+    visitabile = fortino.get("visitabile", False)
+    descrizione = fortino.get("descrizione_breve", "")
+    come_arrivare = fortino.get("come_arrivare_breve", "")
+
+    # Header
+    emoji_visit = "✅" if visitabile else "❌"
+    visit_label = {
+        "it": "Visitabile" if visitabile else "Non visitabile",
+        "en": "Visitable" if visitabile else "Not visitable",
+        "de": "Besuchbar" if visitabile else "Nicht besuchbar"
+    }
+
+    text = f"🏰 <b>{nome}</b>\n"
+    if tipo:
+        text += f"📋 {tipo}\n"
+    text += f"📍 {zona}\n"
+    text += f"{emoji_visit} {visit_label.get(lingua, visit_label['it'])}\n\n"
+
+    if descrizione:
+        text += f"{descrizione}\n\n"
+
+    if come_arrivare:
+        arrive_label = {"it": "🚶 Come arrivare:", "en": "🚶 How to get there:", "de": "🚶 Anfahrt:"}
+        text += f"{arrive_label.get(lingua, arrive_label['it'])}\n{come_arrivare}"
+
+    buttons = []
+
+    # Link Google Maps
+    if lat and lng:
+        maps_label = {"it": "📍 Portami qui", "en": "📍 Take me there", "de": "📍 Bring mich hin"}
+        maps_url = f"https://www.google.com/maps/dir/?api=1&destination={lat},{lng}"
+        buttons.append([InlineKeyboardButton(maps_label.get(lingua, maps_label["it"]), url=maps_url)])
+
+    # Bottone indietro alla zona
+    zona_key = zona.lower().replace("'", "").replace(" ", "_")
+    btn_back = {"it": f"◀️ {zona}", "en": f"◀️ {zona}", "de": f"◀️ {zona}"}
+    buttons.append([InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data=f"fort_zona_{zona_key}")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+
+    if query:
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def handle_percorsi_lista(context, chat_id: int, lingua: str, query=None):
+    """
+    Lista dei 3 percorsi fortini.
+    """
+    if query:
+        await query.answer()
+
+    percorsi = db.get_percorsi_fortini_attivi()
+
+    header = {
+        "it": "🚴 <b>Percorsi Fortini</b>",
+        "en": "🚴 <b>Fort Routes</b>",
+        "de": "🚴 <b>Festungsrouten</b>"
+    }
+
+    text = header.get(lingua, header["it"])
+
+    buttons = []
+    for percorso in percorsi:
+        nome = percorso.get("nome", "Percorso")
+        percorso_id = percorso.get("id")
+        mezzo = percorso.get("mezzo", "bici")
+        emoji = "🚴" if mezzo == "bici" else "🚶" if mezzo == "piedi" else "🚗"
+        lunghezza = percorso.get("lunghezza_km", 0)
+        buttons.append([InlineKeyboardButton(f"{emoji} {nome} ({lunghezza} km)", callback_data=f"fort_percorso_{percorso_id}")])
+
+    btn_back = {"it": "◀️ Fortini", "en": "◀️ Forts", "de": "◀️ Festungen"}
+    buttons.append([InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data="menu_fortini")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+
+    if query:
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def handle_percorsi_dettaglio(context, chat_id: int, lingua: str, query, percorso_id: str):
+    """
+    Scheda dettaglio percorso con km, durata e fortini inclusi.
+    """
+    if query:
+        await query.answer()
+
+    percorso = db.get_percorso_by_id(percorso_id)
+
+    if not percorso:
+        error = {"it": "Percorso non trovato.", "en": "Route not found.", "de": "Route nicht gefunden."}
+        text = f"⚠️ {error.get(lingua, error['it'])}"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀️ Percorsi", callback_data="fort_percorsi")]
+        ])
+        if query:
+            await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+        return
+
+    nome = percorso.get("nome", "Percorso")
+    descrizione = percorso.get("descrizione_breve", "")
+    mezzo = percorso.get("mezzo", "bici")
+    lunghezza = percorso.get("lunghezza_km", 0)
+    durata = percorso.get("durata_min", 0)
+    panoramico = percorso.get("panoramico", False)
+
+    emoji_mezzo = "🚴" if mezzo == "bici" else "🚶" if mezzo == "piedi" else "🚗"
+    mezzo_label = {
+        "bici": {"it": "In bici", "en": "By bike", "de": "Mit dem Fahrrad"},
+        "piedi": {"it": "A piedi", "en": "On foot", "de": "Zu Fuß"},
+        "auto": {"it": "In auto", "en": "By car", "de": "Mit dem Auto"}
+    }
+
+    text = f"🚴 <b>{nome}</b>\n\n"
+    text += f"{emoji_mezzo} {mezzo_label.get(mezzo, mezzo_label['bici']).get(lingua, mezzo_label['bici']['it'])}\n"
+    text += f"📏 {lunghezza} km\n"
+
+    # Durata in ore:minuti
+    if durata >= 60:
+        ore = durata // 60
+        minuti = durata % 60
+        durata_str = f"{ore}h {minuti}min" if minuti else f"{ore}h"
+    else:
+        durata_str = f"{durata} min"
+    text += f"⏱️ {durata_str}\n"
+
+    if panoramico:
+        panoramico_label = {"it": "🌅 Percorso panoramico", "en": "🌅 Scenic route", "de": "🌅 Panoramaroute"}
+        text += f"{panoramico_label.get(lingua, panoramico_label['it'])}\n"
+
+    if descrizione:
+        text += f"\n{descrizione}\n"
+
+    # Fortini nel percorso
+    fortini_percorso = db.get_fortini_in_percorso(percorso_id)
+    if fortini_percorso:
+        tappe_label = {"it": "📍 Tappe:", "en": "📍 Stops:", "de": "📍 Stationen:"}
+        text += f"\n{tappe_label.get(lingua, tappe_label['it'])}\n"
+        for i, fortino in enumerate(fortini_percorso, 1):
+            text += f"{i}. {fortino.get('nome', 'Fortino')}\n"
+
+    buttons = []
+
+    # Bottoni per i singoli fortini
+    for fortino in fortini_percorso[:3]:  # Max 3 per non ingombrare
+        fortino_id = fortino.get("id")
+        buttons.append([InlineKeyboardButton(f"🏰 {fortino.get('nome', '')}", callback_data=f"fort_detail_{fortino_id}")])
+
+    btn_back = {"it": "◀️ Percorsi", "en": "◀️ Routes", "de": "◀️ Routen"}
+    buttons.append([InlineKeyboardButton(btn_back.get(lingua, btn_back["it"]), callback_data="fort_percorsi")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+
+    if query:
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="HTML")
 
 
 async def handle_attivita(context, chat_id: int, lingua: str, query=None):

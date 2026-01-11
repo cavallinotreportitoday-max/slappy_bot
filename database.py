@@ -868,6 +868,59 @@ def get_prossimi_orari_bus(linea_codice: str, fermata_nome: str, direzione: str 
         return []
 
 
+def get_orari_traghetto(linea_codice: str, fermata_nome: str, direzione: str = "andata",
+                        ora_partenza: str = None, limit: int = 10) -> list:
+    """
+    Restituisce orari traghetti dalla tabella orari_bus (linee 12, 14, 15).
+
+    Args:
+        linea_codice: "12", "14", "15"
+        fermata_nome: nome fermata (es. "Punta Sabbioni")
+        direzione: "andata" o "ritorno"
+        ora_partenza: orario minimo (HH:MM), se None restituisce tutti
+        limit: numero massimo di risultati
+
+    Returns:
+        Lista di orari [{ora: "HH:MM", tipo_giorno: "fF", ...}, ...]
+    """
+    from datetime import datetime
+    import pytz
+
+    try:
+        rome_tz = pytz.timezone("Europe/Rome")
+        now = datetime.now(rome_tz)
+
+        # Normalizza formato ora da HH:MM:SS a HH:MM
+        def normalize_ora(orario_dict):
+            if orario_dict and "ora" in orario_dict:
+                ora_raw = orario_dict["ora"]
+                if ora_raw and len(ora_raw) > 5:
+                    orario_dict["ora"] = ora_raw[:5]
+            return orario_dict
+
+        # Query base
+        query = supabase.table("orari_bus") \
+            .select("*") \
+            .eq("linea_codice", linea_codice) \
+            .eq("fermata_nome", fermata_nome) \
+            .eq("direzione", direzione)
+
+        # Se ora_partenza specificata, filtra
+        if ora_partenza:
+            ora_min = ora_partenza if len(ora_partenza) > 5 else f"{ora_partenza}:00"
+            query = query.gte("ora", ora_min)
+
+        response = query.order("ora").limit(limit).execute()
+
+        if response.data:
+            return [normalize_ora(o) for o in response.data]
+        return []
+
+    except Exception as e:
+        logger.error(f"Errore get_orari_traghetto: {e}")
+        return []
+
+
 def get_fermata_bus(linea_codice: str, fermata_nome: str) -> Optional[dict]:
     """
     Restituisce info su una fermata specifica dalla tabella fermate_bus.
@@ -982,15 +1035,116 @@ def calcola_arrivo_fermata(ora_partenza: str, linea_codice: str, fermata_partenz
         logger.error(f"Errore calcola_arrivo_fermata: {e}")
         return None
 
-def get_orari_traghetto(linea_codice: str, fermata_nome: str, direzione: str = "andata", ora_partenza: str = None, limit: int = 5):
-    """Ritorna i prossimi orari di un traghetto ACTV."""
+
+# ============ FORTINI ============
+
+def get_fortini_by_zona(zona: str) -> list:
+    """
+    Restituisce fortini di una zona ordinati per ruolo_percorso (hub→tappa→isolato).
+
+    Args:
+        zona: nome zona (es. "Cavallino", "Ca' Savio")
+
+    Returns:
+        Lista di fortini ordinati
+    """
     try:
-        query = supabase.table("orari_bus").select("*").eq("linea_codice", linea_codice).eq("fermata_nome", fermata_nome).eq("direzione", direzione).eq("attivo", True)
-        if ora_partenza:
-            query = query.gte("ora", ora_partenza)
-        query = query.order("ora").limit(limit)
-        result = query.execute()
-        return result.data or []
-    except Exception as e:
-        logger.error(f"Errore get_orari_traghetto: {e}")
+        # Ordine ruolo: hub=1, tappa=2, isolato=3
+        response = supabase.table("fortini") \
+            .select("*") \
+            .eq("zona", zona) \
+            .execute()
+
+        if response.data:
+            # Ordina per ruolo_percorso
+            ruolo_ordine = {"hub": 1, "tappa": 2, "isolato": 3}
+            fortini = sorted(
+                response.data,
+                key=lambda f: ruolo_ordine.get(f.get("ruolo_percorso", "isolato"), 3)
+            )
+            return fortini
         return []
+    except Exception as e:
+        logger.error(f"Errore get_fortini_by_zona {zona}: {e}")
+        return []
+
+
+def get_fortino_by_id(fortino_id: str) -> Optional[dict]:
+    """Restituisce un fortino specifico per ID."""
+    try:
+        response = supabase.table("fortini") \
+            .select("*") \
+            .eq("id", fortino_id) \
+            .limit(1) \
+            .execute()
+
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Errore get_fortino_by_id {fortino_id}: {e}")
+        return None
+
+
+def get_percorsi_fortini_attivi() -> list:
+    """Restituisce tutti i percorsi fortini attivi."""
+    try:
+        response = supabase.table("percorsi") \
+            .select("*") \
+            .order("id") \
+            .execute()
+
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Errore get_percorsi_fortini_attivi: {e}")
+        return []
+
+
+def get_fortini_in_percorso(percorso_id: str) -> list:
+    """
+    Restituisce i fortini di un percorso in ordine.
+
+    Args:
+        percorso_id: ID del percorso
+
+    Returns:
+        Lista di fortini con ordine nel percorso
+    """
+    try:
+        # Join percorsi_fortini con fortini
+        response = supabase.table("percorsi_fortini") \
+            .select("ordine, fortini(*)") \
+            .eq("percorso_id", percorso_id) \
+            .order("ordine") \
+            .execute()
+
+        if response.data:
+            # Estrai fortini con ordine
+            result = []
+            for item in response.data:
+                fortino = item.get("fortini", {})
+                if fortino:
+                    fortino["ordine_percorso"] = item.get("ordine", 0)
+                    result.append(fortino)
+            return result
+        return []
+    except Exception as e:
+        logger.error(f"Errore get_fortini_in_percorso {percorso_id}: {e}")
+        return []
+
+
+def get_percorso_by_id(percorso_id: str) -> Optional[dict]:
+    """Restituisce un percorso specifico per ID."""
+    try:
+        response = supabase.table("percorsi") \
+            .select("*") \
+            .eq("id", percorso_id) \
+            .limit(1) \
+            .execute()
+
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Errore get_percorso_by_id {percorso_id}: {e}")
+        return None
